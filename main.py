@@ -1,7 +1,8 @@
+import json
 from contextlib import asynccontextmanager
-from typing import Literal
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-import uvicorn
+from typing import Literal, Optional
+import asyncio
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from friendlywords.friendlywords import FriendlyWords
 import redis.asyncio as redis
 from starlette.websockets import WebSocketState
@@ -9,122 +10,104 @@ from starlette.websockets import WebSocketState
 ROOM_EXPIRE = 5 * 60
 
 r: redis.Redis | None = None
+words = FriendlyWords("")
+
 
 @asynccontextmanager
 async def lifespan(fastapi: FastAPI):
     global r
     r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+    words.preload()
     yield
     if r is None: return
     await r.aclose()
     r = None
 
 app = FastAPI(lifespan=lifespan)
-words = FriendlyWords("")
-words.preload()
 
 
-class WebsocketHandler:
-    websockets: dict[str, dict[str, WebSocket]] = {}
-
-    @staticmethod
-    async def send_to_other_in_room(room_id: str, message: str, own_role: Literal["server", "client"]):
-        receiver_role = WebsocketHandler.other_role(own_role)
-        ws = WebsocketHandler.websockets.get(room_id, {}).get(receiver_role)
-        if not ws: return
-
-        try:
-            await ws.send_text(message)
-        except (RuntimeError, WebSocketDisconnect):
-            room = WebsocketHandler.websockets.get(room_id)
-            if room and room.get(receiver_role) is ws:
-                del room[receiver_role]
-                if not room.get("client") and not room.get("server"):
-                    try:
-                        await r.delete(f"room:{room_id}")
-                    finally:
-                        WebsocketHandler.websockets.pop(room_id, None)
-
-    @staticmethod
-    def other_role(role: Literal["server", "client"]):
-        return "server" if role == "client" else "client"
+# @app.get("/rooms/create")
+# async def create_room():
+#     while True:
+#         room_id = words.generate(6, separator="-")
+#         if await r.get(f"room:{room_id}") is None:
+#             break
+#
+#     await r.set(f"room:{room_id}", "", ex=ROOM_EXPIRE)
+#     return {"room_id": room_id, "ex": ROOM_EXPIRE}
 
 
-@app.get("/rooms/create")
-async def create_room():
-    while True:
-        room_id = words.generate(6, separator="-")
-        if await r.get(f"room:{room_id}") is None:
-            break
-
-    await r.set(f"room:{room_id}", "", ex=ROOM_EXPIRE)
-    return {"room_id": room_id, "ex": ROOM_EXPIRE}
+async def safe_ws_close(ws: WebSocket, code: int = 1000):
+    try:
+        state = getattr(ws, "application_state", None) or getattr(ws, "client_state", None)
+        if state == WebSocketState.CONNECTED:
+            await ws.close(code=code)
+    except RuntimeError:
+        pass
 
 
-@app.websocket("/ws/{room_id}")
-async def websocket_endpoint(websocket: WebSocket, room_id: str, role: Literal["server", "client"]):
-    if await r.get(f"room:{room_id}") is None:
-        try:
-            await websocket.close()
-        except RuntimeError:
-            pass
-        return
-    else:
-        await r.expire(f"room:{room_id}", ROOM_EXPIRE)
+async def pubsub_forward(ws: WebSocket, subscribe_channel: str, publish_channel: str, room_id: str):
+    pubsub = r.pubsub()
+    await pubsub.subscribe(subscribe_channel)
 
-    await websocket.accept()
+    async def reader():
+        async for message in pubsub.listen():
+            if message["type"] == "message":
+                await ws.send_text(message["data"])
+                print("received " + message["data"])
 
-    if room_id not in WebsocketHandler.websockets:
-        WebsocketHandler.websockets[room_id] = {}
-    WebsocketHandler.websockets[room_id][role] = websocket
+    read_task = asyncio.create_task(reader())
 
     try:
         while True:
-            try:
-                data = await websocket.receive_text()
-                print("received " + data)
-                await WebsocketHandler.send_to_other_in_room(room_id, data, role)
-            except WebSocketDisconnect:
-                break
-            except Exception:
-                break
-
+            data = await ws.receive_text()
+            await r.publish(publish_channel, data)
+            print("published " + data)
+    except Exception:
+        pass
     finally:
+        read_task.cancel()
+        await pubsub.unsubscribe(subscribe_channel)
+        await safe_ws_close(ws)
+
         try:
-            room = WebsocketHandler.websockets.get(room_id)
-            if not room:
-                pass
-            elif role in room:
-                del room[role]
+            keys = [f"{room_id}:server", f"{room_id}:client"]
+            subscribers = [await r.pubsub_numsub(key) for key in keys]
+            if all(count == 0 for _, count in subscribers):
+                await r.delete(f"room:{room_id}")
+        except Exception:
+            pass
 
-                other_role = "client" if role == "server" else "server"
-                other_ws = room.get(other_role)
-                if other_ws:
-                    try:
-                        state = getattr(other_ws, "application_state", None) or getattr(other_ws, "client_state", None)
-                        if state == WebSocketState.CONNECTED:
-                            await other_ws.close()
-                    except RuntimeError:
-                        pass
-                    finally:
-                        room.pop(other_role, None)
 
-                if not room.get("client") and not room.get("server"):
-                    try:
-                        await r.delete(f"room:{room_id}")
-                    finally:
-                        WebsocketHandler.websockets.pop(room_id, None)
+@app.websocket("/ws/rooms")
+async def websocket_endpoint(ws: WebSocket, role: Literal["server", "client"] = Query(), room_id: Optional[str] = None):
+    await ws.accept()
 
-        finally:
-                try:
-                    state = getattr(websocket, "application_state", None) or getattr(websocket, "client_state", None)
-                    if state == WebSocketState.CONNECTED:
-                        await websocket.close()
-                except RuntimeError:
-                    pass
+    if room_id is None:
+        while True:
+            room_id = words.generate(3, separator="-")
+            exists = await r.get(f"room:{room_id}")
+            if not exists:
+                await r.set(f"room:{room_id}", "", ex=ROOM_EXPIRE)
+                break
+        await ws.send_text(json.dumps({"type": "room_id", "value": room_id}))
+    else:
+        try:
+            exists = await r.get(f"room:{room_id}")
+            if not exists is not None:
+                await safe_ws_close(ws, code=1008)
+                return
+            else:
+                await r.expire(f"room:{room_id}", ROOM_EXPIRE)
+        except Exception:
+            await safe_ws_close(ws, code=1011)
+            return
 
+    subscribe_channel = f"room:{room_id}:{role}"
+    publish_channel = f"room:{room_id}:{'server' if role == 'client' else 'client'}"
+
+    await pubsub_forward(ws, subscribe_channel, publish_channel, f"room:{room_id}")
 
 if __name__ == "__main__":
+    import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-

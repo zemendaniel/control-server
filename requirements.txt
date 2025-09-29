@@ -2,3 +2,4 @@ fastapi
 redis
 friendlywords
 uvicorn
+websockets
