@@ -26,57 +26,83 @@ async def lifespan(fastapi: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
-# @app.get("/rooms/create")
-# async def create_room():
-#     while True:
-#         room_id = words.generate(6, separator="-")
-#         if await r.get(f"room:{room_id}") is None:
-#             break
-#
-#     await r.set(f"room:{room_id}", "", ex=ROOM_EXPIRE)
-#     return {"room_id": room_id, "ex": ROOM_EXPIRE}
-
-
 async def safe_ws_close(ws: WebSocket, code: int = 1000):
     try:
         state = getattr(ws, "application_state", None) or getattr(ws, "client_state", None)
         if state == WebSocketState.CONNECTED:
             await ws.close(code=code)
-    except RuntimeError:
-        pass
-
-
-async def pubsub_forward(ws: WebSocket, subscribe_channel: str, publish_channel: str, room_id: str):
-    pubsub = r.pubsub()
-    await pubsub.subscribe(subscribe_channel)
-
-    async def reader():
-        async for message in pubsub.listen():
-            if message["type"] == "message":
-                await ws.send_text(message["data"])
-                print("received " + message["data"])
-
-    read_task = asyncio.create_task(reader())
-
-    try:
-        while True:
-            data = await ws.receive_text()
-            await r.publish(publish_channel, data)
-            print("published " + data)
     except Exception:
         pass
-    finally:
-        read_task.cancel()
-        await pubsub.unsubscribe(subscribe_channel)
-        await safe_ws_close(ws)
+
+
+async def pubsub_forward(ws: WebSocket, subscribe_channel: str, publish_channel: str):
+    if r is None:
+        await safe_ws_close(ws, code=1011)
+        return
+    pubsub = r.pubsub()
+    try:
+        await pubsub.subscribe(subscribe_channel)
+
+        async def reader():
+            try:
+                async for message in pubsub.listen():
+                    if message.get("type") != "message":
+                        continue
+                    payload = message.get("data")
+                    try:
+                        if payload == "disconnect":
+                            await safe_ws_close(ws)
+                            break
+                    except Exception:
+                        # Fall through
+                        pass
+                    try:
+                        await ws.send_text(payload)
+                    except (WebSocketDisconnect, RuntimeError):
+                        break
+            except asyncio.CancelledError:
+                # Expected on shutdown
+                pass
+            except Exception:
+                # Reader errors
+                pass
+
+        read_task = asyncio.create_task(reader())
 
         try:
-            keys = [f"{room_id}:server", f"{room_id}:client"]
-            subscribers = [await r.pubsub_numsub(key) for key in keys]
-            if all(count == 0 for _, count in subscribers):
-                await r.delete(f"room:{room_id}")
+            while True:
+                data = await ws.receive_text()
+                try:
+                    await r.publish(publish_channel, data)
+                except Exception:
+                    # If Redis is unavailable
+                    break
+        except (WebSocketDisconnect, RuntimeError):
+            try:
+                await r.publish(publish_channel, "disconnect")
+            except Exception:
+                pass
+        finally:
+            read_task.cancel()
+            # Ensure the reader finishes
+            await asyncio.gather(read_task, return_exceptions=True)
+            try:
+                await pubsub.unsubscribe(subscribe_channel)
+            except Exception:
+                pass
+            try:
+                await pubsub.aclose()
+            except Exception:
+                pass
+            await safe_ws_close(ws)
+
+    except Exception:
+        # If subscribe failed
+        try:
+            await pubsub.aclose()
         except Exception:
             pass
+        await safe_ws_close(ws, code=1011)
 
 
 @app.websocket("/ws/rooms")
@@ -86,15 +112,19 @@ async def websocket_endpoint(ws: WebSocket, role: Literal["server", "client"] = 
     if room_id is None:
         while True:
             room_id = words.generate(3, separator="-")
-            exists = await r.get(f"room:{room_id}")
-            if not exists:
-                await r.set(f"room:{room_id}", "", ex=ROOM_EXPIRE)
+            try:
+                # NX ensures no race
+                claimed = await r.set(f"room:{room_id}", "", ex=ROOM_EXPIRE, nx=True)
+            except Exception:
+                await safe_ws_close(ws, code=1011)
+                return
+            if claimed:
                 break
         await ws.send_text(json.dumps({"type": "room_id", "value": room_id}))
     else:
         try:
             exists = await r.get(f"room:{room_id}")
-            if not exists is not None:
+            if exists is None:
                 await safe_ws_close(ws, code=1008)
                 return
             else:
@@ -106,7 +136,7 @@ async def websocket_endpoint(ws: WebSocket, role: Literal["server", "client"] = 
     subscribe_channel = f"room:{room_id}:{role}"
     publish_channel = f"room:{room_id}:{'server' if role == 'client' else 'client'}"
 
-    await pubsub_forward(ws, subscribe_channel, publish_channel, f"room:{room_id}")
+    await pubsub_forward(ws, subscribe_channel, publish_channel)
 
 if __name__ == "__main__":
     import uvicorn
