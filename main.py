@@ -1,11 +1,10 @@
-import json
 from contextlib import asynccontextmanager
-from utils import choose_peer_ip
-from fastapi import FastAPI, HTTPException, WebSocket
+from typing import Literal
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 import uvicorn
-from models import NewRoom, JoinRoom
 from friendlywords.friendlywords import FriendlyWords
 import redis.asyncio as redis
+from starlette.websockets import WebSocketState
 
 ROOM_EXPIRE = 5 * 60
 
@@ -16,87 +15,113 @@ async def lifespan(fastapi: FastAPI):
     global r
     r = redis.Redis(host="localhost", port=6379, decode_responses=True)
     yield
-    await r.close()
-    await r.connection_pool.disconnect()
+    if r is None: return
+    await r.aclose()
+    r = None
 
 app = FastAPI(lifespan=lifespan)
 words = FriendlyWords("")
 words.preload()
 
 
-@app.post("/rooms/create")
-async def create_room(data: NewRoom):
+class WebsocketHandler:
+    websockets: dict[str, dict[str, WebSocket]] = {}
+
+    @staticmethod
+    async def send_to_other_in_room(room_id: str, message: str, own_role: Literal["server", "client"]):
+        receiver_role = WebsocketHandler.other_role(own_role)
+        ws = WebsocketHandler.websockets.get(room_id, {}).get(receiver_role)
+        if not ws: return
+
+        try:
+            await ws.send_text(message)
+        except (RuntimeError, WebSocketDisconnect):
+            room = WebsocketHandler.websockets.get(room_id)
+            if room and room.get(receiver_role) is ws:
+                del room[receiver_role]
+                if not room.get("client") and not room.get("server"):
+                    try:
+                        await r.delete(f"room:{room_id}")
+                    finally:
+                        WebsocketHandler.websockets.pop(room_id, None)
+
+    @staticmethod
+    def other_role(role: Literal["server", "client"]):
+        return "server" if role == "client" else "client"
+
+
+@app.get("/rooms/create")
+async def create_room():
     while True:
         room_id = words.generate(6, separator="-")
         if await r.get(f"room:{room_id}") is None:
             break
 
-    room = {
-        "server": data.model_dump(mode="json"),
-        "client": None,
-    }
-
-    await r.set(f"room:{room_id}", json.dumps(room), ex=ROOM_EXPIRE)
+    await r.set(f"room:{room_id}", "", ex=ROOM_EXPIRE)
     return {"room_id": room_id, "ex": ROOM_EXPIRE}
 
 
-@app.post("/rooms/join/{room_id}")
-async def join_room(room_id: str, data: JoinRoom):
-    room = await r.get(f"room:{room_id}")
-    if room is None:
-        raise HTTPException(status_code=404, detail="Room not found")
-
-    room = json.loads(room)
-    if room.get("client") is not None:
-        raise HTTPException(status_code=400, detail="Room already joined")
-
-    room["client"] = data.model_dump(mode="json")
-    await r.set(f"room:{room_id}", json.dumps(room), ex=ROOM_EXPIRE)
-
-    server = room["server"]
-    client = room["client"]
-
-    server_ip = choose_peer_ip(server, client)
-    client_ip = choose_peer_ip(client, server)
-
-    client_info_for_server = {
-        "name": client["name"],
-        "ip": client_ip,
-        "port": client["port"]
-    }
-    server_info_for_client = {
-        "name": server["name"],
-        "ip": server_ip,
-        "port": server["port"]
-    }
-
-    # publish client info for server
-    await r.publish(f"room:{room_id}", json.dumps(client_info_for_server))
-
-    # return server info for the client
-    return server_info_for_client
-
 @app.websocket("/ws/{room_id}")
-async def websocket_endpoint(websocket: WebSocket, room_id: str):
-    room = await r.get(f"room:{room_id}")
-    if room is None:
-        await websocket.close()
+async def websocket_endpoint(websocket: WebSocket, room_id: str, role: Literal["server", "client"]):
+    if await r.get(f"room:{room_id}") is None:
+        try:
+            await websocket.close()
+        except RuntimeError:
+            pass
         return
+    else:
+        await r.expire(f"room:{room_id}", ROOM_EXPIRE)
 
     await websocket.accept()
-    pubsub = r.pubsub()
-    await pubsub.subscribe(f"room:{room_id}")
-    # todo test what happens if room expires while server is listening
-    try:
-        async for message in pubsub.listen():
-            if message["type"] == "message":
-                await websocket.send_text(message["data"])
-                break
-    finally:
-        await pubsub.unsubscribe(f"room:{room_id}")
-        await pubsub.close()
-        await websocket.close()
 
+    if room_id not in WebsocketHandler.websockets:
+        WebsocketHandler.websockets[room_id] = {}
+    WebsocketHandler.websockets[room_id][role] = websocket
+
+    try:
+        while True:
+            try:
+                data = await websocket.receive_text()
+                print("received " + data)
+                await WebsocketHandler.send_to_other_in_room(room_id, data, role)
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                break
+
+    finally:
+        try:
+            room = WebsocketHandler.websockets.get(room_id)
+            if not room:
+                pass
+            elif role in room:
+                del room[role]
+
+                other_role = "client" if role == "server" else "server"
+                other_ws = room.get(other_role)
+                if other_ws:
+                    try:
+                        state = getattr(other_ws, "application_state", None) or getattr(other_ws, "client_state", None)
+                        if state == WebSocketState.CONNECTED:
+                            await other_ws.close()
+                    except RuntimeError:
+                        pass
+                    finally:
+                        room.pop(other_role, None)
+
+                if not room.get("client") and not room.get("server"):
+                    try:
+                        await r.delete(f"room:{room_id}")
+                    finally:
+                        WebsocketHandler.websockets.pop(room_id, None)
+
+        finally:
+                try:
+                    state = getattr(websocket, "application_state", None) or getattr(websocket, "client_state", None)
+                    if state == WebSocketState.CONNECTED:
+                        await websocket.close()
+                except RuntimeError:
+                    pass
 
 
 if __name__ == "__main__":
