@@ -1,4 +1,4 @@
-# todo: slowapi, scaling
+# todo: scaling
 import json
 from contextlib import asynccontextmanager
 from typing import Literal, Optional
@@ -49,7 +49,7 @@ async def lifespan(fastapi: FastAPI):
                 logger.warning("Error while closing Redis connection", exc_info=True)
         r = None
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
 
 async def safe_ws_close(ws: WebSocket, code: int = 1000, reason: str = ""):
