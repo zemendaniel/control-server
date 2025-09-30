@@ -25,6 +25,3 @@ services:
 networks:
   control-server-network:
     driver: bridge
-
-volumes:
-  redis-data:
