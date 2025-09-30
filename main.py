@@ -171,9 +171,9 @@ async def websocket_endpoint(ws: WebSocket, role: Literal["server", "client"] = 
 
     # Server creating a new room
     if role == "server":
-        max_attempts = 100
+        max_attempts = 1000
         for _ in range(max_attempts):
-            room_id = words.generate(3, separator="-")
+            room_id = words.generate(4, separator="-")
             try:
                 claimed = await r.set(f"room:{room_id}:server", "connected", ex=ROOM_EXPIRE, nx=True)
                 if claimed:
