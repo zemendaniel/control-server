@@ -246,7 +246,7 @@ async def websocket_endpoint(ws: WebSocket, role: Literal["server", "client"] = 
             logger.error("Failed to delete room", exc_info=True)
 
 
-@app.get("/health")
+@app.get("/health", dependencies=[Depends(RateLimiter(times=30, seconds=60))])
 async def health(request: Request):
     if r is None:
         return {"status": "unhealthy", "redis": "disconnected"}, 503
