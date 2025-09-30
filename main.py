@@ -1,4 +1,4 @@
-# todo: slowapi, scaling, clean up websocket endpoint
+# todo: slowapi, scaling
 import json
 from contextlib import asynccontextmanager
 from typing import Literal, Optional
@@ -60,7 +60,7 @@ async def pubsub_forward(ws: WebSocket, subscribe_channel: str, publish_channel:
     """Forward messages between WebSocket and Redis pub/sub channels."""
     if r is None:
         logger.error("Redis unavailable in pubsub_forward")
-        await safe_ws_close(ws, code=1011, reason="Service unavailable")
+        await safe_ws_close(ws, code=1011)
         return
 
     pubsub = r.pubsub()
@@ -169,44 +169,40 @@ async def websocket_endpoint(ws: WebSocket, role: Literal["server", "client"] = 
         await safe_ws_close(ws, code=1008, reason="Servers cannot provide room id")
         return
 
-    if room_id is None:
-        # Server creating a new room
+    # Server creating a new room
+    if role == "server":
         max_attempts = 100
-        for attempt in range(max_attempts):
+        for _ in range(max_attempts):
             room_id = words.generate(3, separator="-")
             try:
                 claimed = await r.set(f"room:{room_id}:server", "connected", ex=ROOM_EXPIRE, nx=True)
+                if claimed:
+                    await ws.send_text(json.dumps({
+                        "type": "room_info",
+                        "value": {"id": room_id, "ex": ROOM_EXPIRE}
+                    }))
+                    break
             except Exception:
                 await safe_ws_close(ws, code=1011)
                 return
-            if claimed:
-                break
         else:
             logger.critical("Failed to claim room after max attempts")
             await safe_ws_close(ws, code=1011)
             return
-        await ws.send_text(json.dumps({"type": "room_info",
-                                       "value": {"id": room_id, "ex": ROOM_EXPIRE}
-                                      }))
+
+    # Client joining existing room
     else:
-        # Client joining existing room
         try:
-            # A pipe is kind of like a transaction
             pipe = r.pipeline()
             await pipe.exists(f"room:{room_id}:server")
             await pipe.set(f"room:{room_id}:client", "connected", ex=ROOM_EXPIRE, nx=True)
-            results = await pipe.execute()
-
-            server_exists = results[0]
-            client_claimed = results[1]
+            server_exists, client_claimed = await pipe.execute()
 
             if not server_exists:
-                # Server doesn't exist
                 await safe_ws_close(ws, code=1008, reason="This room does not exist")
                 return
 
             if not client_claimed:
-                # Another client already connected
                 await safe_ws_close(ws, code=1008, reason="This room is already in use")
                 return
 
@@ -219,8 +215,8 @@ async def websocket_endpoint(ws: WebSocket, role: Literal["server", "client"] = 
 
     try:
         await pubsub_forward(ws, subscribe_channel, publish_channel)
+    # Cleanup
     finally:
-        # Cleanup
         try:
             await r.delete(f"room:{room_id}:{role}")
         except Exception:
