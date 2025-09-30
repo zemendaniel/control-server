@@ -3,24 +3,36 @@ services:
     build: .
     container_name: control-server-api
     ports:
-      - "8090:8000"
+      - "8090:8000"   # You can change the port to any available port (change the left one)
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - UVICORN_LOG_LEVEL=INFO
+      - LOG_LEVEL=INFO
+      - ROOM_EXPIRE=300
     depends_on:
       - redis
     networks:
       - control-server-network
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   redis:
     image: redis:7-alpine
     container_name: control-server-redis
-    ports:
-      - "6379:6379"
     networks:
       - control-server-network
     restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 
 networks:
   control-server-network:

@@ -1,3 +1,4 @@
+# todo: slowapi, scaling, clean up websocket endpoint
 import json
 from contextlib import asynccontextmanager
 from typing import Literal, Optional
@@ -7,8 +8,14 @@ from friendlywords.friendlywords import FriendlyWords
 import redis.asyncio as redis
 from starlette.websockets import WebSocketState
 import os
+import logging
 
-ROOM_EXPIRE = 5 * 60
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger("control-server")
+
+
+ROOM_EXPIRE = int(os.getenv("ROOM_EXPIRE", 300))
 
 r: redis.Redis | None = None
 words = FriendlyWords("")
@@ -19,119 +26,190 @@ async def lifespan(fastapi: FastAPI):
     global r
     redis_host = os.getenv("REDIS_HOST", "localhost")
     redis_port = int(os.getenv("REDIS_PORT", "6379"))
-    r = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+    try:
+        r = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+        # Test connection
+        await r.ping()
+    except Exception as e:
+        logger.error(f"Failed to connect to Redis: {e}")
+        raise
     words.preload()
-    yield
-    if r is None: return
-    await r.aclose()
-    r = None
+    try:
+        yield
+    finally:
+        if r is not None:
+            try:
+                await r.aclose()
+            except Exception:
+                logger.warning("Error while closing Redis connection", exc_info=True)
+        r = None
 
 app = FastAPI(lifespan=lifespan)
 
 
-async def safe_ws_close(ws: WebSocket, code: int = 1000):
+async def safe_ws_close(ws: WebSocket, code: int = 1000, reason: str = ""):
     try:
         state = getattr(ws, "application_state", None) or getattr(ws, "client_state", None)
         if state == WebSocketState.CONNECTED:
-            await ws.close(code=code)
+            await ws.close(code=code, reason=reason)
     except Exception:
         pass
 
 
 async def pubsub_forward(ws: WebSocket, subscribe_channel: str, publish_channel: str):
+    """Forward messages between WebSocket and Redis pub/sub channels."""
     if r is None:
-        await safe_ws_close(ws, code=1011)
+        logger.error("Redis unavailable in pubsub_forward")
+        await safe_ws_close(ws, code=1011, reason="Service unavailable")
         return
+
     pubsub = r.pubsub()
-    try:
-        await pubsub.subscribe(subscribe_channel)
+    await pubsub.subscribe(subscribe_channel)
 
-        async def reader():
-            try:
-                async for message in pubsub.listen():
-                    if message.get("type") != "message":
-                        continue
-                    payload = message.get("data")
-                    try:
-                        if payload == "disconnect":
-                            await safe_ws_close(ws)
-                            break
-                    except Exception:
-                        # Fall through
-                        pass
-                    try:
-                        await ws.send_text(payload)
-                    except (WebSocketDisconnect, RuntimeError):
-                        break
-            except asyncio.CancelledError:
-                # Expected on shutdown
-                pass
-            except Exception:
-                # Reader errors
-                pass
+    close_code = 1000
+    close_reason = ""
 
-        read_task = asyncio.create_task(reader())
+    async def reader():
+        """Read from Redis and send to WebSocket."""
+        nonlocal close_code, close_reason
+        try:
+            async for message in pubsub.listen():
+                if message.get("type") != "message":
+                    continue
 
+                payload = message.get("data")
+
+                # Handle control messages
+                if payload == "disconnect":
+                    close_reason = "Peer disconnected"
+                    break
+                if payload == "timeout":
+                    close_code = 1001
+                    close_reason = "Room expired"
+                    break
+
+                # Forward regular messages
+                await ws.send_text(payload)
+
+        except (WebSocketDisconnect, RuntimeError):
+            logger.debug("WebSocket closed during read")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Reader error", exc_info=True)
+
+    async def writer():
+        """Read from WebSocket and publish to Redis."""
+        nonlocal close_code, close_reason
         try:
             while True:
-                data = await ws.receive_text()
-                try:
-                    await r.publish(publish_channel, data)
-                except Exception:
-                    # If Redis is unavailable
-                    break
-        except (WebSocketDisconnect, RuntimeError):
-            try:
-                await r.publish(publish_channel, "disconnect")
-            except Exception:
-                pass
-        finally:
-            read_task.cancel()
-            # Ensure the reader finishes
-            await asyncio.gather(read_task, return_exceptions=True)
-            try:
-                await pubsub.unsubscribe(subscribe_channel)
-            except Exception:
-                pass
-            try:
-                await pubsub.aclose()
-            except Exception:
-                pass
-            await safe_ws_close(ws)
+                data = await asyncio.wait_for(ws.receive_text(), timeout=ROOM_EXPIRE)
 
-    except Exception:
-        # If subscribe failed
-        try:
-            await pubsub.aclose()
+                if len(data) > 64 * 1024:
+                    close_code = 1008
+                    close_reason = "Message too large"
+                    break
+
+                await r.publish(publish_channel, data)
+
+        except asyncio.TimeoutError:
+            close_code = 1001
+            close_reason = "Room expired"
+            await r.publish(publish_channel, "timeout")
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        except asyncio.CancelledError:
+            raise
         except Exception:
             pass
-        await safe_ws_close(ws, code=1011)
+
+    # Run reader and writer concurrently
+    read_task = asyncio.create_task(reader())
+    write_task = asyncio.create_task(writer())
+
+    try:
+        # Wait for either task to complete (one closing means both should close)
+        done, pending = await asyncio.wait(
+            [read_task, write_task],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+
+        # Cancel remaining tasks
+        for task in pending:
+            task.cancel()
+
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    finally:
+        # Notify peer we're disconnecting (if not already notified)
+        if close_code != 1001:  # Don't send disconnect if we sent timeout
+            await r.publish(publish_channel, "disconnect")
+
+        # Cleanup
+        await pubsub.unsubscribe(subscribe_channel)
+        await pubsub.aclose()
+        await safe_ws_close(ws, code=close_code, reason=close_reason)
 
 
 @app.websocket("/ws/rooms")
 async def websocket_endpoint(ws: WebSocket, role: Literal["server", "client"] = Query(), room_id: Optional[str] = None):
     await ws.accept()
+    logger.info(f"WebSocket accepted: role={role}, room_id={room_id}")
+
+    if r is None:
+        logger.error("Redis unavailable in websocket_endpoint")
+        await safe_ws_close(ws, code=1011)
+        return
+
+    if room_id is None and role == "client":
+        await safe_ws_close(ws, code=1008, reason="Clients must provide room id")
+        return
+
+    if room_id is not None and role == "server":
+        await safe_ws_close(ws, code=1008, reason="Servers cannot provide room id")
+        return
 
     if room_id is None:
-        while True:
+        # Server creating a new room
+        max_attempts = 100
+        for attempt in range(max_attempts):
             room_id = words.generate(3, separator="-")
             try:
-                # NX ensures no race
-                claimed = await r.set(f"room:{room_id}", "", ex=ROOM_EXPIRE, nx=True)
+                claimed = await r.set(f"room:{room_id}:server", "connected", ex=ROOM_EXPIRE, nx=True)
             except Exception:
                 await safe_ws_close(ws, code=1011)
                 return
             if claimed:
                 break
-        await ws.send_text(json.dumps({"type": "room_id", "value": room_id}))
+        else:
+            logger.critical("Failed to claim room after max attempts")
+            await safe_ws_close(ws, code=1011)
+            return
+        await ws.send_text(json.dumps({"type": "room_info",
+                                       "value": {"id": room_id, "ex": ROOM_EXPIRE}
+                                      }))
     else:
+        # Client joining existing room
         try:
-            exists = await r.get(f"room:{room_id}")
-            if exists is None:
-                await safe_ws_close(ws, code=1008)
+            # A pipe is kind of like a transaction
+            pipe = r.pipeline()
+            await pipe.exists(f"room:{room_id}:server")
+            await pipe.set(f"room:{room_id}:client", "connected", ex=ROOM_EXPIRE, nx=True)
+            results = await pipe.execute()
+
+            server_exists = results[0]
+            client_claimed = results[1]
+
+            if not server_exists:
+                # Server doesn't exist
+                await safe_ws_close(ws, code=1008, reason="This room does not exist")
                 return
-            else:
-                await r.expire(f"room:{room_id}", ROOM_EXPIRE)
+
+            if not client_claimed:
+                # Another client already connected
+                await safe_ws_close(ws, code=1008, reason="This room is already in use")
+                return
+
         except Exception:
             await safe_ws_close(ws, code=1011)
             return
@@ -139,7 +217,26 @@ async def websocket_endpoint(ws: WebSocket, role: Literal["server", "client"] = 
     subscribe_channel = f"room:{room_id}:{role}"
     publish_channel = f"room:{room_id}:{'server' if role == 'client' else 'client'}"
 
-    await pubsub_forward(ws, subscribe_channel, publish_channel)
+    try:
+        await pubsub_forward(ws, subscribe_channel, publish_channel)
+    finally:
+        # Cleanup
+        try:
+            await r.delete(f"room:{room_id}:{role}")
+        except Exception:
+            logger.error("Failed to delete room", exc_info=True)
+
+
+@app.get("/health")
+async def health():
+    if r is None:
+        return {"status": "unhealthy", "redis": "disconnected"}, 503
+    try:
+        await r.ping()
+        return {"status": "healthy", "redis": "connected"}
+    except Exception:
+        return {"status": "unhealthy", "redis": "error"}, 503
+
 
 if __name__ == "__main__":
     import uvicorn
