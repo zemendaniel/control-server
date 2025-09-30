@@ -6,6 +6,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from friendlywords.friendlywords import FriendlyWords
 import redis.asyncio as redis
 from starlette.websockets import WebSocketState
+import os
 
 ROOM_EXPIRE = 5 * 60
 
@@ -16,7 +17,9 @@ words = FriendlyWords("")
 @asynccontextmanager
 async def lifespan(fastapi: FastAPI):
     global r
-    r = redis.Redis(host="localhost", port=6379, decode_responses=True)
+    redis_host = os.getenv("REDIS_HOST", "localhost")
+    redis_port = int(os.getenv("REDIS_PORT", "6379"))
+    r = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
     words.preload()
     yield
     if r is None: return

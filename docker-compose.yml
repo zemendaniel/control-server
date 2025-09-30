@@ -1,0 +1,30 @@
+services:
+  fastapi:
+    build: .
+    container_name: control-server-api
+    ports:
+      - "8090:8000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      - redis
+    networks:
+      - control-server-network
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: control-server-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - control-server-network
+    restart: unless-stopped
+
+networks:
+  control-server-network:
+    driver: bridge
+
+volumes:
+  redis-data:
