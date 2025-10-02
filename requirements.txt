@@ -4,3 +4,5 @@ friendlywords
 uvicorn
 websockets
 fastapi-limiter
+starlette
+pydantic

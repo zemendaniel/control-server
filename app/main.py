@@ -6,6 +6,7 @@ import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Request, Depends
 from friendlywords.friendlywords import FriendlyWords
 import redis.asyncio as redis
+from starlette.responses import JSONResponse
 from starlette.websockets import WebSocketState
 import os
 import logging
@@ -18,13 +19,28 @@ logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s:
 logger = logging.getLogger("control-server")
 
 ROOM_EXPIRE = int(os.getenv("ROOM_EXPIRE", 300))
+MAX_MESSAGE_SIZE = 4 * 1024
+MAX_ROOM_GENERATION_ATTEMPTS = 1000
+
+class ControlMessage:
+    def __init__(self, message, code, name):
+        self.message = message
+        self.code = code
+        self.name = name
+
+class ControlMessageTypes:
+    DISCONNECT = ControlMessage("", 1000, "!disconnect")
+    TIMEOUT = ControlMessage("Room expired", 1001, "!timeout")
+    MESSAGE_TOO_LONG = ControlMessage("Message too long", 1008, "!message_too_long")
+    RATE_LIMIT_EXCEEDED = ControlMessage("Rate limit exceeded", 1008, "!rate_limit_exceeded")
+
 
 r: redis.Redis | None = None
 words = FriendlyWords("")
 
 
 @asynccontextmanager
-async def lifespan(fastapi: FastAPI):
+async def lifespan(_fastapi: FastAPI):
     global r
     redis_host = os.getenv("REDIS_HOST", "localhost")
     redis_port = int(os.getenv("REDIS_PORT", "6379"))
@@ -62,16 +78,11 @@ async def safe_ws_close(ws: WebSocket, code: int = 1000, reason: str = ""):
 
 async def pubsub_forward(ws: WebSocket, subscribe_channel: str, publish_channel: str, ratelimit: WebSocketRateLimiter):
     """Forward messages between WebSocket and Redis pub/sub channels."""
-    if r is None:
-        logger.error("Redis unavailable in pubsub_forward")
-        await safe_ws_close(ws, code=1011)
-        return
-
     pubsub = r.pubsub()
     await pubsub.subscribe(subscribe_channel)
 
-    close_code = 1000
-    close_reason = ""
+    close_code = ControlMessageTypes.DISCONNECT.code
+    close_reason = ControlMessageTypes.DISCONNECT.message
 
     async def reader():
         """Read from Redis and send to WebSocket."""
@@ -83,24 +94,23 @@ async def pubsub_forward(ws: WebSocket, subscribe_channel: str, publish_channel:
 
                 payload = message.get("data")
 
-                # Handle control messages
-                if payload == "!disconnect":
-                    close_reason = "Peer disconnected"
+                if payload == ControlMessageTypes.DISCONNECT.name:
+                    close_code = ControlMessageTypes.DISCONNECT.code
+                    close_reason = ControlMessageTypes.DISCONNECT.message
                     break
-                if payload == "!timeout":
-                    close_code = 1001
-                    close_reason = "Room expired"
+                if payload == ControlMessageTypes.TIMEOUT.name:
+                    close_code = ControlMessageTypes.TIMEOUT.code
+                    close_reason = ControlMessageTypes.TIMEOUT.message
                     break
-                if payload == "!message_too_long":
-                    close_code = 1008
-                    close_reason = "Message too long"
+                if payload == ControlMessageTypes.MESSAGE_TOO_LONG.name:
+                    close_code = ControlMessageTypes.MESSAGE_TOO_LONG.code
+                    close_reason = ControlMessageTypes.MESSAGE_TOO_LONG.message
                     break
-                if payload == "!rate_limit_exceeded":
-                    close_code = 1008
-                    close_reason = "Rate limit exceeded"
+                if payload == ControlMessageTypes.RATE_LIMIT_EXCEEDED.name:
+                    close_code = ControlMessageTypes.RATE_LIMIT_EXCEEDED.code
+                    close_reason = ControlMessageTypes.RATE_LIMIT_EXCEEDED.message
                     break
 
-                # Forward regular messages
                 await ws.send_text(payload)
 
         except (WebSocketDisconnect, RuntimeError):
@@ -108,7 +118,7 @@ async def pubsub_forward(ws: WebSocket, subscribe_channel: str, publish_channel:
         except asyncio.CancelledError:
             raise
         except Exception:
-            pass
+            logger.error("Error in reader", exc_info=True)
 
     async def writer():
         """Read from WebSocket and publish to Redis."""
@@ -118,10 +128,10 @@ async def pubsub_forward(ws: WebSocket, subscribe_channel: str, publish_channel:
                 data = await asyncio.wait_for(ws.receive_text(), timeout=ROOM_EXPIRE)
                 await ratelimit(ws)
 
-                if len(data) > 16 * 1024:
-                    close_code = 1008
-                    close_reason = "Message too long"
-                    await r.publish(publish_channel, "!message_too_long")
+                if len(data) > MAX_MESSAGE_SIZE:
+                    close_code = ControlMessageTypes.MESSAGE_TOO_LONG.code
+                    close_reason = ControlMessageTypes.MESSAGE_TOO_LONG.message
+                    await r.publish(publish_channel, ControlMessageTypes.MESSAGE_TOO_LONG.name)
                     break
 
                 if data.startswith("!"):
@@ -130,17 +140,17 @@ async def pubsub_forward(ws: WebSocket, subscribe_channel: str, publish_channel:
                 await r.publish(publish_channel, data)
 
         except asyncio.TimeoutError:
-            close_code = 1001
-            close_reason = "Room expired"
-            await r.publish(publish_channel, "!timeout")
+            close_code = ControlMessageTypes.TIMEOUT.code
+            close_reason = ControlMessageTypes.TIMEOUT.message
+            await r.publish(publish_channel, ControlMessageTypes.TIMEOUT.name)
+
         except (WebSocketDisconnect, RuntimeError):
             pass
         except asyncio.CancelledError:
             raise
-        except Exception as e:
-            pass
+        except Exception:
+            logger.error("Error in writer", exc_info=True)
 
-    # Run reader and writer concurrently
     read_task = asyncio.create_task(reader())
     write_task = asyncio.create_task(writer())
 
@@ -151,16 +161,15 @@ async def pubsub_forward(ws: WebSocket, subscribe_channel: str, publish_channel:
             return_when=asyncio.FIRST_COMPLETED
         )
 
-        # Cancel remaining tasks
         for task in pending:
             task.cancel()
 
         await asyncio.gather(*pending, return_exceptions=True)
 
     finally:
-        # Notify peer we're disconnecting (if not already notified)
-        if close_code == 1000:  # Don't send disconnect if we sent something else
-            await r.publish(publish_channel, "!disconnect")
+        # Notify peer we're disconnecting
+        if close_code == ControlMessageTypes.DISCONNECT.code:  # Don't send disconnect if we sent something else
+            await r.publish(publish_channel, ControlMessageTypes.DISCONNECT.message)
 
         # Cleanup
         await pubsub.unsubscribe(subscribe_channel)
@@ -168,15 +177,15 @@ async def pubsub_forward(ws: WebSocket, subscribe_channel: str, publish_channel:
         await safe_ws_close(ws, code=close_code, reason=close_reason)
 
 
-async def rate_limit_callback(ws: WebSocket, pexpire: int, publish_channel: str):
-    await safe_ws_close(ws, code=1008, reason="Rate limit exceeded")
-    await r.publish(publish_channel, "!rate_limit_exceeded")
+async def rate_limit_callback(ws: WebSocket, _expire: int, publish_channel: str):
+    await safe_ws_close(ws, code=ControlMessageTypes.RATE_LIMIT_EXCEEDED.code, reason=ControlMessageTypes.RATE_LIMIT_EXCEEDED.message)
+    await r.publish(publish_channel, ControlMessageTypes.RATE_LIMIT_EXCEEDED.name)
 
 @app.websocket("/ws/rooms")
 async def websocket_endpoint(ws: WebSocket, role: Literal["server", "client"] = Query(), room_id: Optional[str] = None,
-                             rate_limiter: WebSocketRateLimiter = Depends(WebSocketRateLimiter(times=10, seconds=60))):
+                             _rate_limiter: WebSocketRateLimiter = Depends(WebSocketRateLimiter(times=30, seconds=60))):
     await ws.accept()
-    ratelimit = WebSocketRateLimiter(times=20, seconds=60)
+    ratelimit = WebSocketRateLimiter(times=15, seconds=60)
     logger.info(f"WebSocket accepted: role={role}, room_id={room_id}")
 
     if r is None:
@@ -194,8 +203,7 @@ async def websocket_endpoint(ws: WebSocket, role: Literal["server", "client"] = 
 
     # Server creating a new room
     if role == "server":
-        max_attempts = 1000
-        for _ in range(max_attempts):
+        for _ in range(MAX_ROOM_GENERATION_ATTEMPTS):
             room_id = words.generate(4, separator="-")
             try:
                 claimed = await r.set(f"room:{room_id}:server", "connected", ex=ROOM_EXPIRE, nx=True)
@@ -231,6 +239,7 @@ async def websocket_endpoint(ws: WebSocket, role: Literal["server", "client"] = 
 
         except Exception:
             await safe_ws_close(ws, code=1011)
+            logger.error("Failed to join room", exc_info=True)
             return
 
     subscribe_channel = f"room:{room_id}:{role}"
@@ -249,14 +258,12 @@ async def websocket_endpoint(ws: WebSocket, role: Literal["server", "client"] = 
 
 
 @app.get("/health", dependencies=[Depends(RateLimiter(times=30, seconds=60))])
-async def health(request: Request):
-    if r is None:
-        return {"status": "unhealthy", "redis": "disconnected"}, 503
+async def health():
     try:
         await r.ping()
         return {"status": "healthy", "redis": "connected"}
     except Exception:
-        return {"status": "unhealthy", "redis": "error"}, 503
+        return JSONResponse(status_code=503, content={"status": "unhealthy", "redis": "disconnected"})
 
 
 if __name__ == "__main__":
