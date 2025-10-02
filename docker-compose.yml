@@ -1,7 +1,6 @@
 services:
   fastapi:
     build: .
-    container_name: control-server-api
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
