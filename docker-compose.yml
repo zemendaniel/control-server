@@ -7,7 +7,6 @@ services:
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - UVICORN_LOG_LEVEL=info
       - LOG_LEVEL=info
       - ROOM_EXPIRE=300
     depends_on:

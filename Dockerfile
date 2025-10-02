@@ -11,4 +11,5 @@ COPY main.py .
 
 EXPOSE 8000
 
-CMD sh -c 'uvicorn main:app --host 0.0.0.0 --port 8000 --no-server-header --log-level ${UVICORN_LOG_LEVEL}'
+# Change log level if you want to
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--no-server-header", "--log-level", "info"]
