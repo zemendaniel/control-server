@@ -1,4 +1,3 @@
-# todo: scaling
 import json
 from contextlib import asynccontextmanager
 from typing import Literal, Optional
@@ -19,8 +18,8 @@ logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s:
 logger = logging.getLogger("control-server")
 
 ROOM_EXPIRE = int(os.getenv("ROOM_EXPIRE", 300))
-MAX_MESSAGE_SIZE = 4 * 1024
-MAX_ROOM_GENERATION_ATTEMPTS = 1000
+MAX_MESSAGE_SIZE = int(os.getenv("MAX_MESSAGE_SIZE", 4 * 1024))
+MAX_ROOM_GENERATION_ATTEMPTS = int(os.getenv("MAX_ROOM_GENERATION_ATTEMPTS", 1000))
 
 class ControlMessage:
     def __init__(self, message, code, name):
@@ -179,7 +178,10 @@ async def pubsub_forward(ws: WebSocket, subscribe_channel: str, publish_channel:
 
 async def rate_limit_callback(ws: WebSocket, _expire: int, publish_channel: str):
     await safe_ws_close(ws, code=ControlMessageTypes.RATE_LIMIT_EXCEEDED.code, reason=ControlMessageTypes.RATE_LIMIT_EXCEEDED.message)
-    await r.publish(publish_channel, ControlMessageTypes.RATE_LIMIT_EXCEEDED.name)
+    try:
+        await r.publish(publish_channel, ControlMessageTypes.RATE_LIMIT_EXCEEDED.name)
+    except Exception:
+        logger.error("Failed to publish rate limit exceeded", exc_info=True)
 
 @app.websocket("/ws/rooms")
 async def websocket_endpoint(ws: WebSocket, role: Literal["server", "client"] = Query(), room_id: Optional[str] = None,

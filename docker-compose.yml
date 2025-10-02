@@ -6,6 +6,8 @@ services:
       - REDIS_PORT=6379
       - LOG_LEVEL=info
       - ROOM_EXPIRE=300
+      - MAX_MESSAGE_SIZE=4096
+      - MAX_ROOM_GENERATION_ATTEMPTS=1000
     depends_on:
       - redis
     networks:
