@@ -116,7 +116,7 @@ async def pubsub_forward(ws: WebSocket, subscribe_channel: str, publish_channel:
         try:
             while True:
                 data = await asyncio.wait_for(ws.receive_text(), timeout=ROOM_EXPIRE)
-                await ratelimit(ws)
+                await ratelimit(ws, context_key=subscribe_channel)
 
                 if len(data) > 16 * 1024:
                     close_code = 1008
