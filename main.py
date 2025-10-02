@@ -17,7 +17,6 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("control-server")
 
-
 ROOM_EXPIRE = int(os.getenv("ROOM_EXPIRE", 300))
 
 r: redis.Redis | None = None
@@ -85,18 +84,18 @@ async def pubsub_forward(ws: WebSocket, subscribe_channel: str, publish_channel:
                 payload = message.get("data")
 
                 # Handle control messages
-                if payload == "disconnect":
+                if payload == "!disconnect":
                     close_reason = "Peer disconnected"
                     break
-                if payload == "timeout":
+                if payload == "!timeout":
                     close_code = 1001
                     close_reason = "Room expired"
                     break
-                if payload == "message_too_long":
+                if payload == "!message_too_long":
                     close_code = 1008
                     close_reason = "Message too long"
                     break
-                if payload == "rate_limit_exceeded":
+                if payload == "!rate_limit_exceeded":
                     close_code = 1008
                     close_reason = "Rate limit exceeded"
                     break
@@ -122,15 +121,18 @@ async def pubsub_forward(ws: WebSocket, subscribe_channel: str, publish_channel:
                 if len(data) > 16 * 1024:
                     close_code = 1008
                     close_reason = "Message too long"
-                    await r.publish(publish_channel, "message_too_long")
+                    await r.publish(publish_channel, "!message_too_long")
                     break
+
+                if data.startswith("!"):
+                    continue
 
                 await r.publish(publish_channel, data)
 
         except asyncio.TimeoutError:
             close_code = 1001
             close_reason = "Room expired"
-            await r.publish(publish_channel, "timeout")
+            await r.publish(publish_channel, "!timeout")
         except (WebSocketDisconnect, RuntimeError):
             pass
         except asyncio.CancelledError:
@@ -158,7 +160,7 @@ async def pubsub_forward(ws: WebSocket, subscribe_channel: str, publish_channel:
     finally:
         # Notify peer we're disconnecting (if not already notified)
         if close_code == 1000:  # Don't send disconnect if we sent something else
-            await r.publish(publish_channel, "disconnect")
+            await r.publish(publish_channel, "!disconnect")
 
         # Cleanup
         await pubsub.unsubscribe(subscribe_channel)
@@ -168,7 +170,7 @@ async def pubsub_forward(ws: WebSocket, subscribe_channel: str, publish_channel:
 
 async def rate_limit_callback(ws: WebSocket, pexpire: int, publish_channel: str):
     await safe_ws_close(ws, code=1008, reason="Rate limit exceeded")
-    await r.publish(publish_channel, "rate_limit_exceeded")
+    await r.publish(publish_channel, "!rate_limit_exceeded")
 
 @app.websocket("/ws/rooms")
 async def websocket_endpoint(ws: WebSocket, role: Literal["server", "client"] = Query(), room_id: Optional[str] = None,
