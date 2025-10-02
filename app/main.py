@@ -169,7 +169,7 @@ async def pubsub_forward(ws: WebSocket, subscribe_channel: str, publish_channel:
     finally:
         # Notify peer we're disconnecting
         if close_code == ControlMessageTypes.DISCONNECT.code:  # Don't send disconnect if we sent something else
-            await r.publish(publish_channel, ControlMessageTypes.DISCONNECT.message)
+            await r.publish(publish_channel, ControlMessageTypes.DISCONNECT.name)
 
         # Cleanup
         await pubsub.unsubscribe(subscribe_channel)
