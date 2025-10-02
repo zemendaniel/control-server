@@ -7,7 +7,7 @@ ENV PYTHONUNBUFFERED=1
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py .
+COPY app/ .
 
 EXPOSE 8000
 

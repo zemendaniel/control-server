@@ -15,7 +15,7 @@ from fastapi_limiter.depends import RateLimiter, WebSocketRateLimiter
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-logger = logging.getLogger("control-server")
+logger = logging.getLogger("signaling-server")
 
 ROOM_EXPIRE = int(os.getenv("ROOM_EXPIRE", 300))
 
@@ -174,9 +174,9 @@ async def rate_limit_callback(ws: WebSocket, pexpire: int, publish_channel: str)
 
 @app.websocket("/ws/rooms")
 async def websocket_endpoint(ws: WebSocket, role: Literal["server", "client"] = Query(), room_id: Optional[str] = None,
-                             rate_limiter: WebSocketRateLimiter = Depends(WebSocketRateLimiter(times=10, seconds=60))):
+                             rate_limiter: WebSocketRateLimiter = Depends(WebSocketRateLimiter(times=60, seconds=60))):
     await ws.accept()
-    ratelimit = WebSocketRateLimiter(times=20, seconds=60)
+    ratelimit = WebSocketRateLimiter(times=15, seconds=60)
     logger.info(f"WebSocket accepted: role={role}, room_id={room_id}")
 
     if r is None:
