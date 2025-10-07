@@ -212,7 +212,7 @@ async def websocket_endpoint(ws: WebSocket, role: Literal["server", "client"] = 
                 if claimed:
                     await ws.send_text(json.dumps({
                         "type": "room_info",
-                        "value": {"id": room_id, "ex": ROOM_EXPIRE}
+                        "data": json.dumps({"id": room_id, "ex": ROOM_EXPIRE})
                     }))
                     break
             except Exception:
