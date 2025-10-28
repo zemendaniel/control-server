@@ -1,9 +1,10 @@
+import random
+import string
 import json
 from contextlib import asynccontextmanager
 from typing import Literal, Optional
 import asyncio
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query, Request, Depends
-from friendlywords.friendlywords import FriendlyWords
 import redis.asyncio as redis
 from starlette.responses import JSONResponse
 from starlette.websockets import WebSocketState
@@ -29,13 +30,12 @@ class ControlMessage:
 
 class ControlMessageTypes:
     DISCONNECT = ControlMessage("", 1000, "!disconnect")
-    TIMEOUT = ControlMessage("Room expired", 1001, "!timeout")
-    MESSAGE_TOO_LONG = ControlMessage("Message too long", 1008, "!message_too_long")
-    RATE_LIMIT_EXCEEDED = ControlMessage("Rate limit exceeded", 1008, "!rate_limit_exceeded")
+    TIMEOUT = ControlMessage("Room expired.", 1001, "!timeout")
+    MESSAGE_TOO_LONG = ControlMessage("Message too long.", 1008, "!message_too_long")
+    RATE_LIMIT_EXCEEDED = ControlMessage("Rate limit exceeded.", 1008, "!rate_limit_exceeded")
 
 
 r: redis.Redis | None = None
-words = FriendlyWords("")
 
 
 @asynccontextmanager
@@ -51,7 +51,6 @@ async def lifespan(_fastapi: FastAPI):
     except Exception as e:
         logger.error(f"Failed to connect to Redis: {e}")
         raise
-    words.preload()
     try:
         yield
     finally:
@@ -196,17 +195,17 @@ async def websocket_endpoint(ws: WebSocket, role: Literal["server", "client"] = 
         return
 
     if room_id is None and role == "client":
-        await safe_ws_close(ws, code=1008, reason="Clients must provide room id")
+        await safe_ws_close(ws, code=1008, reason="Clients must provide room id.")
         return
 
     if room_id is not None and role == "server":
-        await safe_ws_close(ws, code=1008, reason="Servers cannot provide room id")
+        await safe_ws_close(ws, code=1008, reason="Servers cannot provide room id.")
         return
 
     # Server creating a new room
     if role == "server":
         for _ in range(MAX_ROOM_GENERATION_ATTEMPTS):
-            room_id = words.generate(4, separator="-")
+            room_id = ''.join(random.choices(string.ascii_uppercase, k=3)) + "-" + ''.join(random.choices(string.digits, k=3))
             try:
                 claimed = await r.set(f"room:{room_id}:server", "connected", ex=ROOM_EXPIRE, nx=True)
                 if claimed:
@@ -232,11 +231,11 @@ async def websocket_endpoint(ws: WebSocket, role: Literal["server", "client"] = 
             server_exists, client_claimed = await pipe.execute()
 
             if not server_exists:
-                await safe_ws_close(ws, code=1008, reason="This room does not exist")
+                await safe_ws_close(ws, code=1008, reason="This room does not exist.")
                 return
 
             if not client_claimed:
-                await safe_ws_close(ws, code=1008, reason="This room is already in use")
+                await safe_ws_close(ws, code=1008, reason="This room is already in use.")
                 return
 
         except Exception:
